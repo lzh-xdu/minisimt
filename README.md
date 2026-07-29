@@ -1,24 +1,29 @@
 # MiniSIMT
 
 MiniSIMT is a small C++20 functional model for learning GPU Core execution
-semantics and architecture verification. It executes a deliberately tiny
-instruction set and produces deterministic state traces.
+semantics and architecture verification. It executes a deliberately tiny ISA,
+models a four-lane SIMT warp, and emits deterministic state and memory traces.
 
 ## Current Status
 
-Version `0.1.0` models one scalar thread context:
+Version `0.4.0` can execute a complete four-element vector-add kernel:
 
-- `MOV_IMM`: move an immediate value into a register.
-- `MOV_REG`: copy one register into another.
-- `ADD`: add two source registers.
-- `EXIT`: halt the thread.
-- Eight integer registers, a program counter, and thread completion state.
-- Operand validation with an atomic error contract: failed instructions do not
-  change architectural state.
-- Automated normal, boundary, malformed-instruction, and program-flow tests.
+- A `Warp` owns one shared program counter and four lane contexts.
+- Each lane owns private integer registers and completion state.
+- A four-bit active mask selects which lanes execute an instruction.
+- `LANE_ID` exposes the physical lane index to the program.
+- `LD` and `ST` access a shared, word-addressed `GlobalMemory`.
+- `MOV_IMM`, `MOV_REG`, `ADD`, and `MUL` provide integer data operations.
+- `EXIT` finishes active lanes and halts the warp.
+- All active-lane operands and addresses are validated before commit, so one
+  invalid lane cannot cause partial register or memory updates.
+- JSON Lines traces include complete before/after warp state and one memory
+  access record per active lane.
+- Scalar `ThreadContext` execution remains available for focused instruction
+  tests.
 
-Warp execution, active masks, memory instructions, branch divergence, Python
-golden references, and performance metrics are planned follow-up milestones.
+Conditional branches, divergence and reconvergence, shared memory, multi-warp
+scheduling, and performance counters are planned follow-up milestones.
 
 ## Build and Test
 
@@ -31,25 +36,75 @@ ctest --test-dir build --output-on-failure
 
 On Linux or macOS, run `./build/minisimt_demo` for the final command.
 
-## Example Program
+Expected demo output:
 
 ```text
-MOV_IMM R0, 10
-MOV_IMM R1, 20
-ADD R2, R0, R1
-MOV_REG R3, R2
+MiniSIMT four-lane vector-add kernel
+A = [1, 2, 3, 4]
+B = [10, 20, 30, 40]
+C = [11, 22, 33, 44]
+status = PASS
+```
+
+Use `minisimt_demo --trace` to emit one compact JSON object per step.
+
+## Vector-Add Kernel
+
+The demo stores `A`, `B`, and `C` in three contiguous four-word memory regions.
+Each lane computes one element:
+
+```text
+LANE_ID R0
+LD      R1, [R0]
+LD      R2, [R0 + 4]
+ADD     R3, R1, R2
+ST      [R0 + 8], R3
 EXIT
 ```
 
-Expected final state:
+`LANE_ID` gives lanes 0 through 3 different addresses while all lanes fetch the
+same instruction from the shared PC. This is the smallest end-to-end example
+that demonstrates the difference between SIMT execution and four independent
+scalar interpreters.
+
+## Memory Model
+
+`GlobalMemory` is a vector of integer words. `LD` and `ST` use base-plus-offset
+addressing:
 
 ```text
-R0=10 R1=20 R2=30 R3=30 finished=true
+LD Rdst, [Rbase + offset]
+ST [Rbase + offset], Rvalue
 ```
+
+Addresses are word indexes, not byte addresses. Negative and out-of-range
+addresses return `Error`. Before any lane commits an instruction, MiniSIMT
+validates every active lane. Inactive lanes neither validate nor access memory.
+When multiple active lanes store to the same address, ascending lane order
+defines the deterministic final value.
+
+## Active Mask Convention
+
+Traces print mask bits in lane order 3 through 0, where the rightmost bit is
+lane 0. For example, `0b0101` activates lanes 0 and 2. An inactive lane does
+not change registers or access memory, while the warp still advances its
+single shared PC.
+
+## Structured Trace
+
+`step_with_trace()` stores:
+
+- the complete warp state before execution;
+- the fetched instruction, or `null` if fetch did not occur;
+- the `Executed`, `Halted`, or `Error` result;
+- one load/store record per active lane;
+- the complete warp state after execution.
+
+See [`docs/trace-schema.md`](docs/trace-schema.md) for the field contract.
 
 ## Project Boundaries
 
 MiniSIMT is an educational functional model. It does not implement a commercial
-GPU ISA, cycle-accurate timing, a compiler, a runtime, or RTL behavior. See
-[`docs/architecture.md`](docs/architecture.md) and
+GPU ISA, cycle-accurate timing, a compiler, a driver, a runtime, caches, or RTL
+behavior. See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/verification-plan.md`](docs/verification-plan.md).

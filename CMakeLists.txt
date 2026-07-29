@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(minisimt VERSION 0.1.0 LANGUAGES CXX)
+project(minisimt VERSION 0.4.0 LANGUAGES CXX)
 
 add_library(minisimt
     src/model.cpp
+    src/trace.cpp
 )
 
 target_include_directories(minisimt
