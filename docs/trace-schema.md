@@ -25,6 +25,8 @@ out-of-range PC, a finished warp, or an empty active mask.
 | `src1` | integer |
 | `src2` | integer |
 | `immediate` | integer |
+| `target` | integer |
+| `reconverge` | integer |
 
 Unused operands retain the instruction model's sentinel values.
 
@@ -47,9 +49,20 @@ are ordered by ascending lane index.
 | `pc` | non-negative integer | Shared warp program counter |
 | `finished` | boolean | Warp completion state |
 | `active_mask` | four-character string | Bits for lanes 3 through 0 |
+| `reconvergence_stack` | array | Deferred divergent paths |
 | `lanes` | array of four lane objects | Lane-private state |
 
 Each lane object contains `finished` and an array of eight integer registers.
+
+## Reconvergence Frame Object
+
+| Field | Type | Meaning |
+|---|---|---|
+| `reconverge_mask` | four-character string | Mask active before divergence |
+| `pending_mask` | four-character string | Lanes assigned to the deferred path |
+| `pending_pc` | non-negative integer | Deferred path entry PC |
+| `reconverge_pc` | non-negative integer | PC where both paths merge |
+| `pending_path_started` | boolean | Whether execution switched to the deferred path |
 
 ## Illustrative Shape
 
@@ -61,7 +74,9 @@ Each lane object contains `finished` and an array of eight integer registers.
     "dst": 1,
     "src1": 0,
     "src2": -1,
-    "immediate": 4
+    "immediate": 4,
+    "target": -1,
+    "reconverge": -1
   },
   "memory_accesses": [
     {"lane": 0, "kind": "load", "address": 4, "value": 10}
@@ -70,12 +85,14 @@ Each lane object contains `finished` and an array of eight integer registers.
     "pc": 0,
     "finished": false,
     "active_mask": "0001",
+    "reconvergence_stack": [],
     "lanes": [four complete lane snapshots]
   },
   "after": {
     "pc": 1,
     "finished": false,
     "active_mask": "0001",
+    "reconvergence_stack": [],
     "lanes": [four complete lane snapshots]
   }
 }

@@ -21,18 +21,8 @@ void print_values(
     std::cout << "]\n";
 }
 
-} // namespace
-
-int main(int argc, char* argv[])
+int run_vector_add(bool emit_trace)
 {
-    const bool emit_trace =
-        argc == 2 && std::string_view{argv[1]} == "--trace";
-    if (argc > 2 ||
-        (argc == 2 && !emit_trace)) {
-        std::cerr << "Usage: minisimt_demo [--trace]\n";
-        return 2;
-    }
-
     constexpr std::size_t vector_size = minisimt::kWarpLaneCount;
     constexpr int a_base = 0;
     constexpr int b_base = static_cast<int>(vector_size);
@@ -96,4 +86,96 @@ int main(int argc, char* argv[])
     }
 
     return 0;
+}
+
+int run_branch_divergence(bool emit_trace)
+{
+    const minisimt::Program program{
+        minisimt::Instruction::lane_id(0),
+        minisimt::Instruction::mov_imm(1, 2),
+        minisimt::Instruction::cmp_lt(2, 0, 1),
+        minisimt::Instruction::branch_if(2, 6, 7),
+        minisimt::Instruction::mov_imm(3, 200),
+        minisimt::Instruction::jump(7),
+        minisimt::Instruction::mov_imm(3, 100),
+        minisimt::Instruction::add(4, 3, 0),
+        minisimt::Instruction::exit(),
+    };
+
+    minisimt::Warp warp;
+    while (true) {
+        minisimt::WarpTraceRecord record;
+        const minisimt::StepResult result =
+            minisimt::step_with_trace(program, warp, record);
+
+        if (emit_trace) {
+            std::cout << minisimt::format_trace_json(record) << '\n';
+        }
+
+        if (result != minisimt::StepResult::Executed) {
+            if (result == minisimt::StepResult::Error) {
+                std::cerr << "MiniSIMT branch execution failed at pc="
+                          << warp.pc << '\n';
+                return 1;
+            }
+            break;
+        }
+    }
+
+    std::array<int, minisimt::kWarpLaneCount> predicate{};
+    std::array<int, minisimt::kWarpLaneCount> path_value{};
+    std::array<int, minisimt::kWarpLaneCount> merged{};
+    for (std::size_t lane = 0; lane < minisimt::kWarpLaneCount; ++lane) {
+        predicate[lane] = warp.lanes[lane].registers[2];
+        path_value[lane] = warp.lanes[lane].registers[3];
+        merged[lane] = warp.lanes[lane].registers[4];
+    }
+
+    constexpr std::array<int, minisimt::kWarpLaneCount>
+        expected_predicate{1, 1, 0, 0};
+    constexpr std::array<int, minisimt::kWarpLaneCount>
+        expected_path_value{100, 100, 200, 200};
+    constexpr std::array<int, minisimt::kWarpLaneCount>
+        expected_merged{100, 101, 202, 203};
+
+    if (predicate != expected_predicate ||
+        path_value != expected_path_value ||
+        merged != expected_merged) {
+        std::cerr << "Branch-divergence result mismatch\n";
+        return 1;
+    }
+
+    if (!emit_trace) {
+        std::cout << "MiniSIMT four-lane branch divergence\n";
+        print_values("predicate", predicate);
+        print_values("path_value", path_value);
+        print_values("merged", merged);
+        std::cout << "status = PASS\n";
+    }
+
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char* argv[])
+{
+    bool emit_trace = false;
+    bool branch_demo = false;
+
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{argv[index]};
+        if (argument == "--trace" && !emit_trace) {
+            emit_trace = true;
+        } else if (argument == "--branch" && !branch_demo) {
+            branch_demo = true;
+        } else {
+            std::cerr << "Usage: minisimt_demo [--branch] [--trace]\n";
+            return 2;
+        }
+    }
+
+    return branch_demo
+        ? run_branch_divergence(emit_trace)
+        : run_vector_add(emit_trace);
 }

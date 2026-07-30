@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <sstream>
+#include <utility>
 
 namespace minisimt {
 namespace {
@@ -20,6 +21,13 @@ namespace {
            instruction.src2 == -1;
 }
 
+[[nodiscard]] bool has_no_control_operands(
+    const Instruction& instruction) noexcept
+{
+    return instruction.target == -1 &&
+           instruction.reconverge == -1;
+}
+
 [[nodiscard]] bool is_valid_instruction(
     const Instruction& instruction) noexcept
 {
@@ -27,43 +35,102 @@ namespace {
     case Opcode::MovImm:
         return is_valid_register(instruction.dst) &&
                instruction.src1 == -1 &&
-               instruction.src2 == -1;
+               instruction.src2 == -1 &&
+               has_no_control_operands(instruction);
 
     case Opcode::MovReg:
         return is_valid_register(instruction.dst) &&
                is_valid_register(instruction.src1) &&
                instruction.src2 == -1 &&
-               instruction.immediate == 0;
+               instruction.immediate == 0 &&
+               has_no_control_operands(instruction);
 
     case Opcode::Add:
     case Opcode::Mul:
+    case Opcode::CmpLt:
         return is_valid_register(instruction.dst) &&
                is_valid_register(instruction.src1) &&
                is_valid_register(instruction.src2) &&
-               instruction.immediate == 0;
+               instruction.immediate == 0 &&
+               has_no_control_operands(instruction);
 
     case Opcode::LaneId:
         return is_valid_register(instruction.dst) &&
                instruction.src1 == -1 &&
                instruction.src2 == -1 &&
-               instruction.immediate == 0;
+               instruction.immediate == 0 &&
+               has_no_control_operands(instruction);
 
     case Opcode::Load:
         return is_valid_register(instruction.dst) &&
                is_valid_register(instruction.src1) &&
-               instruction.src2 == -1;
+               instruction.src2 == -1 &&
+               has_no_control_operands(instruction);
 
     case Opcode::Store:
         return instruction.dst == -1 &&
                is_valid_register(instruction.src1) &&
-               is_valid_register(instruction.src2);
+               is_valid_register(instruction.src2) &&
+               has_no_control_operands(instruction);
+
+    case Opcode::BranchIf:
+        return instruction.dst == -1 &&
+               is_valid_register(instruction.src1) &&
+               instruction.src2 == -1 &&
+               instruction.immediate == 0 &&
+               instruction.target >= 0 &&
+               instruction.reconverge >= 0;
+
+    case Opcode::Jump:
+        return has_no_register_operands(instruction) &&
+               instruction.immediate == 0 &&
+               instruction.target >= 0 &&
+               instruction.reconverge == -1;
 
     case Opcode::Exit:
         return has_no_register_operands(instruction) &&
-               instruction.immediate == 0;
+               instruction.immediate == 0 &&
+               has_no_control_operands(instruction);
     }
 
     return false;
+}
+
+[[nodiscard]] bool has_valid_control_flow(
+    const Instruction& instruction,
+    std::size_t pc,
+    const Program& program) noexcept
+{
+    switch (instruction.opcode) {
+    case Opcode::BranchIf: {
+        const auto target =
+            static_cast<std::size_t>(instruction.target);
+        const auto reconverge =
+            static_cast<std::size_t>(instruction.reconverge);
+        if (target >= program.size() ||
+            reconverge >= program.size() ||
+            target <= pc + 1 ||
+            reconverge <= target) {
+            return false;
+        }
+
+        const Instruction& fallthrough_delimiter =
+            program[target - 1];
+        return fallthrough_delimiter.opcode == Opcode::Jump &&
+               is_valid_instruction(fallthrough_delimiter) &&
+               static_cast<std::size_t>(
+                   fallthrough_delimiter.target) == reconverge;
+    }
+
+    case Opcode::Jump: {
+        const auto target =
+            static_cast<std::size_t>(instruction.target);
+        return target < program.size() && target > pc;
+    }
+
+    default:
+        return true;
+    }
 }
 
 [[nodiscard]] bool is_memory_instruction(Opcode opcode) noexcept
@@ -146,6 +213,14 @@ void execute_lane_instruction(
         return;
     }
 
+    case Opcode::CmpLt:
+        registers[static_cast<std::size_t>(instruction.dst)] =
+            registers[static_cast<std::size_t>(instruction.src1)] <
+                    registers[static_cast<std::size_t>(instruction.src2)]
+                ? 1
+                : 0;
+        return;
+
     case Opcode::LaneId:
         registers[static_cast<std::size_t>(instruction.dst)] =
             static_cast<int>(lane_id);
@@ -175,8 +250,31 @@ void execute_lane_instruction(
         return;
     }
 
+    case Opcode::BranchIf:
+    case Opcode::Jump:
     case Opcode::Exit:
         return;
+    }
+}
+
+void advance_reconvergence(Warp& warp) noexcept
+{
+    while (!warp.reconvergence_stack.empty()) {
+        ReconvergenceFrame& frame =
+            warp.reconvergence_stack.back();
+        if (warp.pc != frame.reconverge_pc) {
+            return;
+        }
+
+        if (!frame.pending_path_started) {
+            frame.pending_path_started = true;
+            warp.active_mask = frame.pending_mask;
+            warp.pc = frame.pending_pc;
+            return;
+        }
+
+        warp.active_mask = frame.reconverge_mask;
+        warp.reconvergence_stack.pop_back();
     }
 }
 
@@ -198,6 +296,13 @@ StepResult step_scalar(
         return StepResult::Error;
     }
 
+    if (!has_valid_control_flow(
+            instruction,
+            context.pc,
+            program)) {
+        return StepResult::Error;
+    }
+
     if (!has_valid_memory_access(
             instruction,
             context.registers,
@@ -208,6 +313,22 @@ StepResult step_scalar(
     if (instruction.opcode == Opcode::Exit) {
         context.finished = true;
         return StepResult::Halted;
+    }
+
+    if (instruction.opcode == Opcode::BranchIf) {
+        if (context.registers[
+                static_cast<std::size_t>(instruction.src1)] != 0) {
+            context.pc =
+                static_cast<std::size_t>(instruction.target);
+        } else {
+            ++context.pc;
+        }
+        return StepResult::Executed;
+    }
+
+    if (instruction.opcode == Opcode::Jump) {
+        context.pc = static_cast<std::size_t>(instruction.target);
+        return StepResult::Executed;
     }
 
     execute_lane_instruction(
@@ -222,7 +343,7 @@ StepResult step_scalar(
 StepResult step_warp(
     const Program& program,
     Warp& warp,
-    GlobalMemory* memory) noexcept
+    GlobalMemory* memory)
 {
     if (warp.finished || warp.active_mask.none()) {
         return StepResult::Halted;
@@ -234,6 +355,26 @@ StepResult step_warp(
 
     const Instruction& instruction = program[warp.pc];
     if (!is_valid_instruction(instruction)) {
+        return StepResult::Error;
+    }
+
+    if (!has_valid_control_flow(
+            instruction,
+            warp.pc,
+            program)) {
+        return StepResult::Error;
+    }
+
+    if (!warp.reconvergence_stack.empty() &&
+        (instruction.opcode == Opcode::BranchIf ||
+         instruction.opcode == Opcode::Exit)) {
+        return StepResult::Error;
+    }
+
+    if (!warp.reconvergence_stack.empty() &&
+        instruction.opcode == Opcode::Jump &&
+        static_cast<std::size_t>(instruction.target) !=
+            warp.reconvergence_stack.back().reconverge_pc) {
         return StepResult::Error;
     }
 
@@ -264,8 +405,48 @@ StepResult step_warp(
 
         next.active_mask.reset();
         next.finished = true;
-        warp = next;
+        warp = std::move(next);
         return StepResult::Halted;
+    }
+
+    if (instruction.opcode == Opcode::BranchIf) {
+        ActiveMask taken_mask;
+        for (std::size_t lane = 0; lane < next.lanes.size(); ++lane) {
+            if (next.active_mask.test(lane) &&
+                next.lanes[lane].registers[
+                    static_cast<std::size_t>(instruction.src1)] != 0) {
+                taken_mask.set(lane);
+            }
+        }
+
+        const ActiveMask fallthrough_mask =
+            next.active_mask & ~taken_mask;
+        if (taken_mask.none()) {
+            ++next.pc;
+        } else if (fallthrough_mask.none()) {
+            next.pc = static_cast<std::size_t>(instruction.target);
+        } else {
+            next.reconvergence_stack.push_back({
+                next.active_mask,
+                taken_mask,
+                static_cast<std::size_t>(instruction.target),
+                static_cast<std::size_t>(instruction.reconverge),
+                false,
+            });
+            next.active_mask = fallthrough_mask;
+            ++next.pc;
+        }
+
+        advance_reconvergence(next);
+        warp = std::move(next);
+        return StepResult::Executed;
+    }
+
+    if (instruction.opcode == Opcode::Jump) {
+        next.pc = static_cast<std::size_t>(instruction.target);
+        advance_reconvergence(next);
+        warp = std::move(next);
+        return StepResult::Executed;
     }
 
     for (std::size_t lane = 0; lane < next.lanes.size(); ++lane) {
@@ -279,7 +460,8 @@ StepResult step_warp(
     }
 
     ++next.pc;
-    warp = next;
+    advance_reconvergence(next);
+    warp = std::move(next);
     return StepResult::Executed;
 }
 
@@ -298,7 +480,7 @@ StepResult step(
     return step_scalar(program, context, &memory);
 }
 
-StepResult step(const Program& program, Warp& warp) noexcept
+StepResult step(const Program& program, Warp& warp)
 {
     return step_warp(program, warp, nullptr);
 }
@@ -306,7 +488,7 @@ StepResult step(const Program& program, Warp& warp) noexcept
 StepResult step(
     const Program& program,
     Warp& warp,
-    GlobalMemory& memory) noexcept
+    GlobalMemory& memory)
 {
     return step_warp(program, warp, &memory);
 }
@@ -322,12 +504,18 @@ std::string opcode_name(Opcode opcode)
         return "ADD";
     case Opcode::Mul:
         return "MUL";
+    case Opcode::CmpLt:
+        return "CMP_LT";
     case Opcode::LaneId:
         return "LANE_ID";
     case Opcode::Load:
         return "LD";
     case Opcode::Store:
         return "ST";
+    case Opcode::BranchIf:
+        return "BRA_IF";
+    case Opcode::Jump:
+        return "JUMP";
     case Opcode::Exit:
         return "EXIT";
     }
@@ -373,6 +561,11 @@ std::string format_instruction(const Instruction& instruction)
                << ", R" << instruction.src1
                << ", R" << instruction.src2;
         break;
+    case Opcode::CmpLt:
+        output << " R" << instruction.dst
+               << ", R" << instruction.src1
+               << ", R" << instruction.src2;
+        break;
     case Opcode::LaneId:
         output << " R" << instruction.dst;
         break;
@@ -396,6 +589,14 @@ std::string format_instruction(const Instruction& instruction)
                    << -static_cast<std::int64_t>(instruction.immediate);
         }
         output << "], R" << instruction.src2;
+        break;
+    case Opcode::BranchIf:
+        output << " R" << instruction.src1
+               << ", " << instruction.target
+               << ", reconverge=" << instruction.reconverge;
+        break;
+    case Opcode::Jump:
+        output << ' ' << instruction.target;
         break;
     case Opcode::Exit:
         break;
@@ -422,7 +623,25 @@ std::string format_warp(const Warp& warp)
     std::ostringstream output;
     output << "pc=" << warp.pc
            << " finished=" << (warp.finished ? "true" : "false")
-           << " active_mask=0b" << warp.active_mask.to_string();
+           << " active_mask=0b" << warp.active_mask.to_string()
+           << " reconvergence_depth="
+           << warp.reconvergence_stack.size();
+
+    for (std::size_t index = 0;
+         index < warp.reconvergence_stack.size();
+         ++index) {
+        const ReconvergenceFrame& frame =
+            warp.reconvergence_stack[index];
+        output << "\n  frame=" << index
+               << " reconverge_mask=0b"
+               << frame.reconverge_mask.to_string()
+               << " pending_mask=0b"
+               << frame.pending_mask.to_string()
+               << " pending_pc=" << frame.pending_pc
+               << " reconverge_pc=" << frame.reconverge_pc
+               << " pending_path_started="
+               << (frame.pending_path_started ? "true" : "false");
+    }
 
     for (std::size_t lane = 0; lane < warp.lanes.size(); ++lane) {
         const LaneContext& context = warp.lanes[lane];

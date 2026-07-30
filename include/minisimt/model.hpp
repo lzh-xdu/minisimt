@@ -20,9 +20,12 @@ enum class Opcode {
     MovReg,
     Add,
     Mul,
+    CmpLt,
     LaneId,
     Load,
     Store,
+    BranchIf,
+    Jump,
     Exit,
 };
 
@@ -38,6 +41,8 @@ struct Instruction {
     int src1{-1};
     int src2{-1};
     int immediate{0};
+    int target{-1};
+    int reconverge{-1};
 
     bool operator==(const Instruction&) const = default;
 
@@ -83,6 +88,20 @@ struct Instruction {
         };
     }
 
+    [[nodiscard]] static constexpr Instruction cmp_lt(
+        int dst_register,
+        int lhs_register,
+        int rhs_register) noexcept
+    {
+        return {
+            Opcode::CmpLt,
+            dst_register,
+            lhs_register,
+            rhs_register,
+            0,
+        };
+    }
+
     [[nodiscard]] static constexpr Instruction lane_id(
         int dst_register) noexcept
     {
@@ -117,6 +136,36 @@ struct Instruction {
         };
     }
 
+    [[nodiscard]] static constexpr Instruction branch_if(
+        int predicate_register,
+        int target_pc,
+        int reconverge_pc) noexcept
+    {
+        return {
+            Opcode::BranchIf,
+            -1,
+            predicate_register,
+            -1,
+            0,
+            target_pc,
+            reconverge_pc,
+        };
+    }
+
+    [[nodiscard]] static constexpr Instruction jump(
+        int target_pc) noexcept
+    {
+        return {
+            Opcode::Jump,
+            -1,
+            -1,
+            -1,
+            0,
+            target_pc,
+            -1,
+        };
+    }
+
     [[nodiscard]] static constexpr Instruction exit() noexcept
     {
         return {Opcode::Exit, -1, -1, -1, 0};
@@ -138,11 +187,22 @@ struct LaneContext {
     bool operator==(const LaneContext&) const = default;
 };
 
+struct ReconvergenceFrame {
+    ActiveMask reconverge_mask{};
+    ActiveMask pending_mask{};
+    std::size_t pending_pc{0};
+    std::size_t reconverge_pc{0};
+    bool pending_path_started{false};
+
+    bool operator==(const ReconvergenceFrame&) const = default;
+};
+
 struct Warp {
     std::array<LaneContext, kWarpLaneCount> lanes{};
     ActiveMask active_mask{0b1111};
     std::size_t pc{0};
     bool finished{false};
+    std::vector<ReconvergenceFrame> reconvergence_stack{};
 
     bool operator==(const Warp&) const = default;
 };
@@ -160,12 +220,12 @@ using Program = std::vector<Instruction>;
 
 [[nodiscard]] StepResult step(
     const Program& program,
-    Warp& warp) noexcept;
+    Warp& warp);
 
 [[nodiscard]] StepResult step(
     const Program& program,
     Warp& warp,
-    GlobalMemory& memory) noexcept;
+    GlobalMemory& memory);
 
 [[nodiscard]] std::string opcode_name(Opcode opcode);
 [[nodiscard]] std::string step_result_name(StepResult result);

@@ -31,7 +31,35 @@ void append_instruction_json(
            << ",\"src1\":" << instruction->src1
            << ",\"src2\":" << instruction->src2
            << ",\"immediate\":" << instruction->immediate
+           << ",\"target\":" << instruction->target
+           << ",\"reconverge\":" << instruction->reconverge
            << '}';
+}
+
+void append_reconvergence_stack_json(
+    std::ostringstream& output,
+    const std::vector<ReconvergenceFrame>& stack)
+{
+    output << '[';
+
+    for (std::size_t index = 0; index < stack.size(); ++index) {
+        if (index != 0) {
+            output << ',';
+        }
+
+        const ReconvergenceFrame& frame = stack[index];
+        output << "{\"reconverge_mask\":\""
+               << frame.reconverge_mask.to_string()
+               << "\",\"pending_mask\":\""
+               << frame.pending_mask.to_string()
+               << "\",\"pending_pc\":" << frame.pending_pc
+               << ",\"reconverge_pc\":" << frame.reconverge_pc
+               << ",\"pending_path_started\":"
+               << (frame.pending_path_started ? "true" : "false")
+               << '}';
+    }
+
+    output << ']';
 }
 
 void append_warp_json(
@@ -43,7 +71,11 @@ void append_warp_json(
            << (warp.finished ? "true" : "false")
            << ",\"active_mask\":\""
            << warp.active_mask.to_string()
-           << "\",\"lanes\":[";
+           << "\",\"reconvergence_stack\":";
+    append_reconvergence_stack_json(
+        output,
+        warp.reconvergence_stack);
+    output << ",\"lanes\":[";
 
     for (std::size_t lane = 0; lane < warp.lanes.size(); ++lane) {
         if (lane != 0) {

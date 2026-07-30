@@ -12,6 +12,9 @@ global memory.
 |---|---|---|
 | Data | Immediate and register moves | Destination updated, `pc + 1` |
 | Data | Addition and multiplication | Result written to destination |
+| Predicate | `CMP_LT` true and false | Destination contains 1 or 0 |
+| Control | Taken and fallthrough `BRA_IF` | PC selects the expected path |
+| Control | Forward `JUMP` | PC becomes the target |
 | Built-in | `LANE_ID` | Scalar lane index is zero |
 | Memory | `LD` with positive offset | Selected word loaded |
 | Memory | `ST` with positive offset | Selected word stored |
@@ -30,6 +33,13 @@ global memory.
 | Built-in | Four-lane `LANE_ID` | Registers contain 0, 1, 2, 3 |
 | Shared state | Four active lanes | Shared PC advances exactly once |
 | Mask | `0b0101` data instruction | Only lanes 0 and 2 execute |
+| Branch | Uniform predicate | Correct PC, no reconvergence frame |
+| Branch | Mixed predicate | Paths serialize under complementary masks |
+| Reconvergence | Both paths reach merge PC | Entry mask restored, frame removed |
+| Invalid | Malformed branch target | `Error`, no state change |
+| Invalid | Missing fallthrough delimiter | `Error`, no state change |
+| Invalid | Divergent path jumps away from merge | `Error`, no state change |
+| Invalid | `EXIT` before reconvergence | `Error`, no state change |
 | Memory | Masked `LD` | Inactive invalid addresses are ignored |
 | Memory | One active out-of-range `ST` | No lane or memory update |
 | Lifecycle | Warp `EXIT` | Active lanes finish and mask clears |
@@ -46,10 +56,12 @@ global memory.
 | Fetch error | PC out of range | `instruction=null`, before equals after |
 | Serialization | Traced `EXIT` | One valid JSON line |
 | Serialization | Traced `LD` | Lane, kind, address, and value serialized |
+| Divergence | Traced mixed `BRA_IF` | Deferred mask and PCs serialized |
+| Reconvergence | Traced merge | Restored mask and empty stack serialized |
 
 ## Future Test Layers
 
-- Branch divergence and reconvergence traces.
+- Nested divergence and early-exit mask handling.
 - Shared-memory and barrier ordering.
 - Multi-warp scheduling fairness and determinism.
 - Python CPU reference and trace diff.

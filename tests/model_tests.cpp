@@ -18,6 +18,21 @@ void check(bool condition, std::string_view message)
     }
 }
 
+[[nodiscard]] minisimt::Program make_branch_program()
+{
+    return {
+        minisimt::Instruction::lane_id(0),
+        minisimt::Instruction::mov_imm(1, 2),
+        minisimt::Instruction::cmp_lt(2, 0, 1),
+        minisimt::Instruction::branch_if(2, 6, 7),
+        minisimt::Instruction::mov_imm(3, 200),
+        minisimt::Instruction::jump(7),
+        minisimt::Instruction::mov_imm(3, 100),
+        minisimt::Instruction::add(4, 3, 0),
+        minisimt::Instruction::exit(),
+    };
+}
+
 void test_mov_immediate()
 {
     const minisimt::Program program{
@@ -97,6 +112,25 @@ void test_mul()
           "MUL returns Executed");
     check(context.registers[2] == -42, "MUL writes the product");
     check(context.pc == 1, "MUL advances the program counter");
+}
+
+void test_cmp_lt()
+{
+    const minisimt::Program program{
+        minisimt::Instruction::cmp_lt(2, 0, 1),
+    };
+    minisimt::ThreadContext context;
+    context.registers[0] = -2;
+    context.registers[1] = 3;
+
+    const auto result = minisimt::step(program, context);
+
+    check(result == minisimt::StepResult::Executed,
+          "CMP_LT returns Executed");
+    check(context.registers[2] == 1,
+          "CMP_LT writes one when lhs is smaller");
+    check(context.pc == 1,
+          "CMP_LT advances the program counter");
 }
 
 void test_exit()
@@ -188,6 +222,81 @@ void test_program_flow()
     check(context.registers[3] == 30, "program copies R2 into R3");
     check(context.pc == 4, "program counter points at EXIT");
     check(context.finished, "program marks the thread as finished");
+}
+
+void test_scalar_branch_flow()
+{
+    const minisimt::Program program = make_branch_program();
+    minisimt::ThreadContext context;
+
+    minisimt::StepResult result = minisimt::StepResult::Executed;
+    while (result == minisimt::StepResult::Executed) {
+        result = minisimt::step(program, context);
+    }
+
+    check(result == minisimt::StepResult::Halted,
+          "scalar branch program reaches EXIT");
+    check(context.registers[2] == 1,
+          "scalar CMP_LT produces a true predicate");
+    check(context.registers[3] == 100,
+          "scalar BRA_IF selects the taken path");
+    check(context.registers[4] == 100,
+          "scalar execution reaches the merge instruction");
+    check(context.pc == 8,
+          "scalar branch program leaves pc at EXIT");
+}
+
+void test_invalid_branch_target_is_atomic()
+{
+    const minisimt::Program program{
+        minisimt::Instruction::branch_if(0, 3, 4),
+    };
+    minisimt::ThreadContext context;
+    context.registers[0] = 1;
+    const minisimt::ThreadContext thread_before = context;
+    minisimt::Warp warp;
+    warp.lanes[0].registers[0] = 1;
+    const minisimt::Warp warp_before = warp;
+
+    const auto thread_result = minisimt::step(program, context);
+    const auto warp_result = minisimt::step(program, warp);
+
+    check(thread_result == minisimt::StepResult::Error,
+          "out-of-range scalar branch target returns Error");
+    check(context == thread_before,
+          "invalid scalar branch changes no state");
+    check(warp_result == minisimt::StepResult::Error,
+          "out-of-range warp branch target returns Error");
+    check(warp == warp_before,
+          "invalid warp branch changes no state");
+}
+
+void test_malformed_branch_layout_is_atomic()
+{
+    const minisimt::Program program{
+        minisimt::Instruction::branch_if(0, 2, 3),
+        minisimt::Instruction::mov_imm(1, 10),
+        minisimt::Instruction::mov_imm(1, 20),
+        minisimt::Instruction::exit(),
+    };
+    minisimt::ThreadContext context;
+    context.registers[0] = 1;
+    const minisimt::ThreadContext thread_before = context;
+    minisimt::Warp warp;
+    warp.lanes[0].registers[0] = 1;
+    const minisimt::Warp warp_before = warp;
+
+    const auto thread_result = minisimt::step(program, context);
+    const auto warp_result = minisimt::step(program, warp);
+
+    check(thread_result == minisimt::StepResult::Error,
+          "branch without a fallthrough delimiter returns scalar Error");
+    check(context == thread_before,
+          "malformed scalar branch layout changes no state");
+    check(warp_result == minisimt::StepResult::Error,
+          "branch without a fallthrough delimiter returns warp Error");
+    check(warp == warp_before,
+          "malformed warp branch layout changes no state");
 }
 
 void test_warp_executes_four_lanes()
@@ -407,6 +516,175 @@ void test_warp_program_flow()
     }
 }
 
+void test_warp_uniform_branch_avoids_stack()
+{
+    const minisimt::Program program{
+        minisimt::Instruction::branch_if(0, 3, 4),
+        minisimt::Instruction::mov_imm(1, 10),
+        minisimt::Instruction::jump(4),
+        minisimt::Instruction::mov_imm(1, 20),
+        minisimt::Instruction::exit(),
+    };
+    minisimt::Warp all_taken;
+    minisimt::Warp none_taken;
+    for (auto& lane : all_taken.lanes) {
+        lane.registers[0] = 1;
+    }
+
+    const auto taken_result = minisimt::step(program, all_taken);
+    const auto fallthrough_result =
+        minisimt::step(program, none_taken);
+
+    check(taken_result == minisimt::StepResult::Executed,
+          "uniform taken BRA_IF returns Executed");
+    check(all_taken.pc == 3,
+          "uniform taken BRA_IF jumps to its target");
+    check(all_taken.active_mask == minisimt::ActiveMask{0b1111},
+          "uniform taken BRA_IF preserves the active mask");
+    check(all_taken.reconvergence_stack.empty(),
+          "uniform taken BRA_IF creates no stack frame");
+    check(fallthrough_result == minisimt::StepResult::Executed,
+          "uniform fallthrough BRA_IF returns Executed");
+    check(none_taken.pc == 1,
+          "uniform fallthrough BRA_IF advances to the next instruction");
+    check(none_taken.active_mask == minisimt::ActiveMask{0b1111},
+          "uniform fallthrough BRA_IF preserves the active mask");
+    check(none_taken.reconvergence_stack.empty(),
+          "uniform fallthrough BRA_IF creates no stack frame");
+}
+
+void test_warp_branch_divergence_and_reconvergence()
+{
+    const minisimt::Program program = make_branch_program();
+    minisimt::Warp warp;
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "branch demo executes LANE_ID");
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "branch demo initializes split threshold");
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "branch demo computes per-lane predicates");
+
+    const auto branch_result = minisimt::step(program, warp);
+
+    check(branch_result == minisimt::StepResult::Executed,
+          "divergent BRA_IF returns Executed");
+    check(warp.pc == 4,
+          "divergent BRA_IF executes the fallthrough path first");
+    check(warp.active_mask == minisimt::ActiveMask{0b1100},
+          "fallthrough path activates lanes 2 and 3");
+    check(warp.reconvergence_stack.size() == 1,
+          "divergent BRA_IF pushes one reconvergence frame");
+    check(
+        warp.reconvergence_stack.back().pending_mask ==
+            minisimt::ActiveMask{0b0011},
+        "reconvergence frame defers taken lanes 0 and 1");
+    check(!warp.reconvergence_stack.back().pending_path_started,
+          "taken path is initially pending");
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "fallthrough path writes its path value");
+    check(warp.pc == 5 &&
+              warp.active_mask == minisimt::ActiveMask{0b1100},
+          "fallthrough path remains active before JUMP");
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "fallthrough JUMP reaches the reconvergence point");
+    check(warp.pc == 6,
+          "reconvergence stack redirects execution to the taken path");
+    check(warp.active_mask == minisimt::ActiveMask{0b0011},
+          "taken path activates lanes 0 and 1");
+    check(warp.reconvergence_stack.back().pending_path_started,
+          "reconvergence frame records the active pending path");
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "taken path writes its path value");
+    check(warp.pc == 7,
+          "taken path reaches the merge instruction");
+    check(warp.active_mask == minisimt::ActiveMask{0b1111},
+          "merge restores the original active mask");
+    check(warp.reconvergence_stack.empty(),
+          "merge pops the reconvergence frame");
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "all lanes execute the merge ADD");
+    check(warp.lanes[0].registers[3] == 100 &&
+              warp.lanes[1].registers[3] == 100,
+          "taken lanes keep the taken-path value");
+    check(warp.lanes[2].registers[3] == 200 &&
+              warp.lanes[3].registers[3] == 200,
+          "fallthrough lanes keep the fallthrough-path value");
+    check(warp.lanes[0].registers[4] == 100 &&
+              warp.lanes[1].registers[4] == 101 &&
+              warp.lanes[2].registers[4] == 202 &&
+              warp.lanes[3].registers[4] == 203,
+          "reconverged ADD executes for all four lanes");
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Halted,
+          "branch demo terminates after reconvergence");
+}
+
+void test_warp_exit_during_divergence_is_atomic()
+{
+    const minisimt::Program program{
+        minisimt::Instruction::branch_if(0, 3, 4),
+        minisimt::Instruction::exit(),
+        minisimt::Instruction::jump(4),
+        minisimt::Instruction::mov_imm(1, 20),
+        minisimt::Instruction::exit(),
+    };
+    minisimt::Warp warp;
+    warp.lanes[0].registers[0] = 1;
+    warp.lanes[1].registers[0] = 1;
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "test setup creates divergent paths");
+    const minisimt::Warp before_exit = warp;
+
+    const auto result = minisimt::step(program, warp);
+
+    check(result == minisimt::StepResult::Error,
+          "EXIT before reconvergence returns Error");
+    check(warp == before_exit,
+          "failed divergent EXIT changes no warp state");
+}
+
+void test_warp_unstructured_jump_is_atomic()
+{
+    const minisimt::Program program{
+        minisimt::Instruction::branch_if(0, 4, 5),
+        minisimt::Instruction::jump(3),
+        minisimt::Instruction::mov_imm(1, 10),
+        minisimt::Instruction::jump(5),
+        minisimt::Instruction::mov_imm(1, 20),
+        minisimt::Instruction::exit(),
+    };
+    minisimt::Warp warp;
+    warp.lanes[0].registers[0] = 1;
+    warp.lanes[1].registers[0] = 1;
+
+    check(minisimt::step(program, warp) ==
+              minisimt::StepResult::Executed,
+          "test setup creates divergence before an unstructured JUMP");
+    const minisimt::Warp before_jump = warp;
+
+    const auto result = minisimt::step(program, warp);
+
+    check(result == minisimt::StepResult::Error,
+          "JUMP away from the reconvergence point returns Error");
+    check(warp == before_jump,
+          "failed divergent JUMP changes no warp state");
+}
+
 void test_scalar_memory_program()
 {
     const minisimt::Program program{
@@ -609,6 +887,43 @@ void test_memory_trace_records_lane_accesses()
         "trace JSON serializes memory access metadata");
 }
 
+void test_branch_trace_records_reconvergence_frame()
+{
+    const minisimt::Program program = make_branch_program();
+    minisimt::Warp warp;
+    static_cast<void>(minisimt::step(program, warp));
+    static_cast<void>(minisimt::step(program, warp));
+    static_cast<void>(minisimt::step(program, warp));
+    minisimt::WarpTraceRecord record;
+
+    const auto result =
+        minisimt::step_with_trace(program, warp, record);
+    const std::string json = minisimt::format_trace_json(record);
+
+    check(result == minisimt::StepResult::Executed,
+          "traced divergent BRA_IF returns Executed");
+    check(record.before.reconvergence_stack.empty(),
+          "branch trace starts without a reconvergence frame");
+    check(record.after.reconvergence_stack.size() == 1,
+          "branch trace captures the pushed frame");
+    check(record.after.active_mask ==
+              minisimt::ActiveMask{0b1100},
+          "branch trace captures the fallthrough mask");
+    check(
+        json.find(
+            "\"opcode\":\"BRA_IF\",\"dst\":-1,\"src1\":2,"
+            "\"src2\":-1,\"immediate\":0,\"target\":6,"
+            "\"reconverge\":7") != std::string::npos,
+        "branch trace serializes control-flow operands");
+    check(
+        json.find(
+            "\"pending_mask\":\"0011\",\"pending_pc\":6,"
+            "\"reconverge_pc\":7,"
+            "\"pending_path_started\":false") !=
+            std::string::npos,
+        "branch trace serializes the reconvergence frame");
+}
+
 void test_warp_trace_record()
 {
     const minisimt::Program program{
@@ -699,11 +1014,15 @@ int main()
     test_register_move();
     test_add();
     test_mul();
+    test_cmp_lt();
     test_exit();
     test_invalid_register_is_atomic();
     test_malformed_instruction_is_atomic();
     test_invalid_pc_is_atomic();
     test_program_flow();
+    test_scalar_branch_flow();
+    test_invalid_branch_target_is_atomic();
+    test_malformed_branch_layout_is_atomic();
     test_warp_executes_four_lanes();
     test_warp_active_mask();
     test_warp_mul();
@@ -713,6 +1032,10 @@ int main()
     test_warp_empty_mask_is_halted();
     test_warp_exit();
     test_warp_program_flow();
+    test_warp_uniform_branch_avoids_stack();
+    test_warp_branch_divergence_and_reconvergence();
+    test_warp_exit_during_divergence_is_atomic();
+    test_warp_unstructured_jump_is_atomic();
     test_scalar_memory_program();
     test_memory_instruction_requires_memory();
     test_warp_lane_id();
@@ -720,6 +1043,7 @@ int main()
     test_warp_memory_error_is_atomic();
     test_vector_add_kernel();
     test_memory_trace_records_lane_accesses();
+    test_branch_trace_records_reconvergence_frame();
     test_warp_trace_record();
     test_warp_trace_without_fetch();
     test_warp_trace_json();
